@@ -1,35 +1,540 @@
-import { useState } from 'react'
-import reactLogo from './assets/react.svg'
-import viteLogo from '/vite.svg'
-import './App.css'
+import { useState, useEffect, useRef } from "react";
+import { io } from "socket.io-client";
+import nacl from "tweetnacl";
+import naclUtil from "tweetnacl-util";
 
-function App() {
-  const [count, setCount] = useState(0)
+// ==================== CONFIG ====================
+const API_URL = "http://localhost:4000/api";
+const SOCKET_URL = "http://localhost:4000";
 
-  return (
-    <>
-      <div>
-        <a href="https://vite.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.jsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        Click on the Vite and React logos to learn more
-      </p>
-    </>
-  )
+// ==================== CRYPTO FUNCTIONS ====================
+
+// Sinh key pair bất đối xứng (Curve25519)
+function generateKeyPair() {
+  const keyPair = nacl.box.keyPair();
+  return {
+    publicKey: naclUtil.encodeBase64(keyPair.publicKey),
+    secretKey: naclUtil.encodeBase64(keyPair.secretKey),
+    raw: keyPair,
+  };
 }
 
-export default App
+// Tạo nonce = random(16 bytes) + counter(8 bytes) = 24 bytes
+function createNonce(counter) {
+  const nonce = new Uint8Array(24);
+  const randomPart = nacl.randomBytes(16);
+  nonce.set(randomPart, 0);
+  const counterBytes = new Uint8Array(8);
+  let c = counter;
+  for (let i = 7; i >= 0; i--) {
+    counterBytes[i] = c & 0xff;
+    c = Math.floor(c / 256);
+  }
+  nonce.set(counterBytes, 16);
+  return nonce;
+}
+
+// Sinh shared key ngẫu nhiên (32 bytes)
+function generateSharedKey() {
+  return nacl.randomBytes(32);
+}
+
+// Mã hóa sharedKey bằng nacl.box
+function encryptSharedKey(sharedKeyBytes, recipientPublicKey, mySecretKey) {
+  const nonce = nacl.randomBytes(24);
+  const recipientPubKeyBytes = naclUtil.decodeBase64(recipientPublicKey);
+  const mySecretKeyBytes = naclUtil.decodeBase64(mySecretKey);
+  const encrypted = nacl.box(
+    sharedKeyBytes,
+    nonce,
+    recipientPubKeyBytes,
+    mySecretKeyBytes
+  );
+  return {
+    encryptedSharedKey: naclUtil.encodeBase64(encrypted),
+    nonce: naclUtil.encodeBase64(nonce),
+  };
+}
+
+// Giải mã sharedKey
+function decryptSharedKey(
+  encryptedBase64,
+  nonceBase64,
+  senderPublicKey,
+  mySecretKey
+) {
+  const encrypted = naclUtil.decodeBase64(encryptedBase64);
+  const nonce = naclUtil.decodeBase64(nonceBase64);
+  const senderPubKeyBytes = naclUtil.decodeBase64(senderPublicKey);
+  const mySecretKeyBytes = naclUtil.decodeBase64(mySecretKey);
+  const decrypted = nacl.box.open(
+    encrypted,
+    nonce,
+    senderPubKeyBytes,
+    mySecretKeyBytes
+  );
+  if (!decrypted) throw new Error("Không thể giải mã sharedKey");
+  return decrypted;
+}
+
+// Mã hóa tin nhắn bằng secretbox
+function encryptMessage(message, sharedKeyBytes, counter) {
+  const nonce = createNonce(counter);
+  const messageBytes = naclUtil.decodeUTF8(message);
+  const encrypted = nacl.secretbox(messageBytes, nonce, sharedKeyBytes);
+  return {
+    encryptedContent: naclUtil.encodeBase64(encrypted),
+    nonce: naclUtil.encodeBase64(nonce),
+  };
+}
+
+// Giải mã tin nhắn
+function decryptMessage(encryptedBase64, nonceBase64, sharedKeyBytes) {
+  const encrypted = naclUtil.decodeBase64(encryptedBase64);
+  const nonce = naclUtil.decodeBase64(nonceBase64);
+  const decrypted = nacl.secretbox.open(encrypted, nonce, sharedKeyBytes);
+  if (!decrypted) throw new Error("Không thể giải mã tin nhắn");
+  return naclUtil.encodeUTF8(decrypted);
+}
+
+// ==================== MAIN APP ====================
+function App() {
+  // State
+  const [step, setStep] = useState("register"); // register | users | chat
+  const [username, setUsername] = useState("");
+  const [currentUser, setCurrentUser] = useState(null);
+  const [users, setUsers] = useState([]);
+  const [chatPartner, setChatPartner] = useState(null);
+  const [currentChat, setCurrentChat] = useState(null);
+  const [messages, setMessages] = useState([]);
+  const [messageInput, setMessageInput] = useState("");
+  const [keyStatus, setKeyStatus] = useState("");
+  const [debugLogs, setDebugLogs] = useState([]);
+
+  // Refs
+  const myKeyPairRef = useRef(null);
+  const sharedKeyRef = useRef(null);
+  const messageCounterRef = useRef(0);
+  const socketRef = useRef(null);
+  const chatBoxRef = useRef(null);
+
+  // Debug logger
+  const log = (msg, data = "") => {
+    const time = new Date().toLocaleTimeString();
+    const entry = `[${time}] ${msg} ${
+      data ? JSON.stringify(data).substring(0, 80) : ""
+    }`;
+    setDebugLogs((prev) => [...prev.slice(-20), entry]);
+  };
+
+  // Auto scroll chat
+  useEffect(() => {
+    if (chatBoxRef.current) {
+      chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
+    }
+  }, [messages]);
+
+  // ==================== REGISTER ====================
+  const register = async () => {
+    if (!username.trim()) return;
+
+    try {
+      // Sinh key pair
+      myKeyPairRef.current = generateKeyPair();
+      log("🔑 Generated key pair");
+
+      const res = await fetch(`${API_URL}/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: username.trim(),
+          publicKey: myKeyPairRef.current.publicKey,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error);
+        return;
+      }
+
+      setCurrentUser(data.user);
+      localStorage.setItem(
+        `secretKey_${data.user._id}`,
+        myKeyPairRef.current.secretKey
+      );
+      log("✅ Registered", { userId: data.user._id });
+
+      // Connect socket
+      connectSocket(data.user._id);
+      setStep("users");
+      loadUsers();
+    } catch (error) {
+      log("❌ Register error", error.message);
+    }
+  };
+
+  // ==================== SOCKET ====================
+  const connectSocket = (userId) => {
+    socketRef.current = io(SOCKET_URL);
+
+    socketRef.current.on("connect", () => {
+      log("🔌 Socket connected");
+      socketRef.current.emit("join", userId);
+    });
+
+    socketRef.current.on("key_received", async (data) => {
+      console.log("🚀 ~ connectSocket ~ data:", data);
+      log("🔑 Received encrypted key");
+      // Will be handled when partner is set
+    });
+
+    socketRef.current.on("receive_message", (message) => {
+      log("📨 Received encrypted", {
+        content: message.encryptedContent?.substring(0, 20) + "...",
+      });
+
+      if (!sharedKeyRef.current) {
+        log("⚠️ No sharedKey yet");
+        return;
+      }
+
+      try {
+        const plaintext = decryptMessage(
+          message.encryptedContent,
+          message.nonce,
+          sharedKeyRef.current
+        );
+        const senderId = message.senderId._id || message.senderId;
+        setMessages((prev) => [
+          ...prev,
+          {
+            text: plaintext,
+            sender: message.senderId.username || "Unknown",
+            isMine: senderId === currentUser?._id,
+            time: new Date(message.timestamp).toLocaleTimeString(),
+          },
+        ]);
+        log("✅ Decrypted", { plaintext });
+      } catch (error) {
+        log("❌ Decrypt error", error.message);
+      }
+    });
+  };
+
+  // ==================== USERS ====================
+  const loadUsers = async () => {
+    try {
+      const res = await fetch(`${API_URL}/users`);
+      const data = await res.json();
+      setUsers(data.filter((u) => u._id !== currentUser?._id));
+      log("📋 Loaded users", data.length);
+    } catch (error) {
+      log("❌ Load users error", error.message);
+    }
+  };
+
+  // ==================== START CHAT ====================
+  const startChat = async (partner) => {
+    setChatPartner(partner);
+    log("💬 Starting chat with", partner.username);
+
+    try {
+      // Create/get chat
+      const res = await fetch(`${API_URL}/chat/create`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          participantIds: [currentUser._id, partner._id],
+        }),
+      });
+
+      const chat = await res.json();
+      setCurrentChat(chat);
+      socketRef.current.emit("join_chat", chat._id);
+      log("📝 Chat created", { chatId: chat._id });
+
+      // Check existing key
+      const keyRes = await fetch(
+        `${API_URL}/chat/${chat._id}/key/${currentUser._id}`
+      );
+
+      if (keyRes.ok) {
+        const keyData = await keyRes.json();
+        try {
+          const senderRes = await fetch(`${API_URL}/user/${keyData.senderId}`);
+          const sender = await senderRes.json();
+          sharedKeyRef.current = decryptSharedKey(
+            keyData.encryptedSharedKey,
+            keyData.nonce,
+            sender.publicKey,
+            myKeyPairRef.current.secretKey
+          );
+          setKeyStatus("🔐 Đã có sharedKey từ trước");
+          log("✅ Loaded existing sharedKey");
+        } catch {
+          await createAndShareKey(chat._id, partner);
+        }
+      } else {
+        await createAndShareKey(chat._id, partner);
+      }
+
+      setStep("chat");
+      await loadMessages(chat._id);
+    } catch (error) {
+      log("❌ Start chat error", error.message);
+    }
+  };
+
+  const createAndShareKey = async (chatId, partner) => {
+    sharedKeyRef.current = generateSharedKey();
+    log("🔑 Generated new sharedKey");
+
+    const { encryptedSharedKey, nonce } = encryptSharedKey(
+      sharedKeyRef.current,
+      partner.publicKey,
+      myKeyPairRef.current.secretKey
+    );
+
+    socketRef.current.emit("key_exchange", {
+      chatId,
+      recipientId: partner._id,
+      senderId: currentUser._id,
+      encryptedSharedKey,
+      nonce,
+    });
+
+    setKeyStatus("🔐 Đã tạo và gửi sharedKey");
+    log("📤 Sent encrypted sharedKey");
+  };
+
+  // ==================== MESSAGES ====================
+  const loadMessages = async (chatId) => {
+    try {
+      const res = await fetch(`${API_URL}/chat/${chatId}/messages`);
+      const data = await res.json();
+
+      const decryptedMessages = [];
+      for (const msg of data) {
+        if (sharedKeyRef.current) {
+          try {
+            const plaintext = decryptMessage(
+              msg.encryptedContent,
+              msg.nonce,
+              sharedKeyRef.current
+            );
+            decryptedMessages.push({
+              text: plaintext,
+              sender: msg.senderId.username,
+              isMine: msg.senderId._id === currentUser._id,
+              time: new Date(msg.timestamp).toLocaleTimeString(),
+            });
+          } catch {
+            log("⚠️ Cannot decrypt old message");
+          }
+        }
+        if (msg.messageCounter >= messageCounterRef.current) {
+          messageCounterRef.current = msg.messageCounter + 1;
+        }
+      }
+      setMessages(decryptedMessages);
+      log("📜 Loaded messages", data.length);
+    } catch (error) {
+      log("❌ Load messages error", error.message);
+    }
+  };
+
+  const sendMessage = () => {
+    if (!messageInput.trim() || !sharedKeyRef.current || !currentChat) return;
+
+    const { encryptedContent, nonce } = encryptMessage(
+      messageInput.trim(),
+      sharedKeyRef.current,
+      messageCounterRef.current
+    );
+
+    log("📤 Sending encrypted", { counter: messageCounterRef.current });
+
+    socketRef.current.emit("send_message", {
+      chatId: currentChat._id,
+      senderId: currentUser._id,
+      encryptedContent,
+      nonce,
+      messageCounter: messageCounterRef.current,
+    });
+
+    messageCounterRef.current++;
+    setMessageInput("");
+  };
+
+  // ==================== RENDER ====================
+  const styles = {
+    container: {
+      maxWidth: 800,
+      margin: "20px auto",
+      fontFamily: "Arial, sans-serif",
+      padding: 20,
+    },
+    section: {
+      border: "1px solid #ccc",
+      padding: 15,
+      margin: "10px 0",
+      borderRadius: 8,
+    },
+    hidden: { display: "none" },
+    input: {
+      padding: "8px 12px",
+      margin: 5,
+      borderRadius: 4,
+      border: "1px solid #ccc",
+    },
+    button: {
+      padding: "8px 16px",
+      margin: 5,
+      background: "#007bff",
+      color: "white",
+      border: "none",
+      borderRadius: 4,
+      cursor: "pointer",
+    },
+    userItem: {
+      padding: 10,
+      margin: 5,
+      background: "#181717ff",
+      cursor: "pointer",
+      borderRadius: 4,
+    },
+    chatBox: {
+      height: 300,
+      overflowY: "auto",
+      border: "1px solid #ddd",
+      padding: 10,
+      margin: "10px 0",
+      background: "#121111ff",
+      borderRadius: 4,
+    },
+    messageSent: {
+      padding: "8px 12px",
+      margin: 5,
+      background: "#1e1f1dff",
+      textAlign: "right",
+      borderRadius: 8,
+    },
+    messageReceived: {
+      padding: "8px 12px",
+      margin: 5,
+      background: "#1d1c1cff",
+      borderRadius: 8,
+    },
+    meta: { fontSize: 11, color: "#666" },
+    debug: {
+      background: "#0b0b0bff",
+      fontFamily: "monospace",
+      fontSize: 11,
+      padding: 10,
+      maxHeight: 150,
+      overflowY: "auto",
+      borderRadius: 4,
+    },
+  };
+
+  return (
+    <div style={styles.container}>
+      <h1>🔐 E2E Chat Demo (React)</h1>
+
+      {/* Step 1: Register */}
+      {step === "register" && (
+        <div style={styles.section}>
+          <h3>Bước 1: Đăng ký</h3>
+          <input
+            style={styles.input}
+            placeholder="Nhập username"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            onKeyPress={(e) => e.key === "Enter" && register()}
+          />
+          <button style={styles.button} onClick={register}>
+            Đăng ký
+          </button>
+        </div>
+      )}
+
+      {/* Step 2: Users */}
+      {step === "users" && (
+        <div style={styles.section}>
+          <h3>Bước 2: Chọn người để chat</h3>
+          <p>
+            Đang đăng nhập: <strong>{currentUser?.username}</strong>
+          </p>
+          <button style={styles.button} onClick={loadUsers}>
+            🔄 Refresh
+          </button>
+          <div>
+            {users.map((user) => (
+              <div
+                key={user._id}
+                style={styles.userItem}
+                onClick={() => startChat(user)}
+              >
+                {user.username}
+              </div>
+            ))}
+            {users.length === 0 && (
+              <p>Chưa có user khác. Mở tab mới để đăng ký user khác.</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Step 3: Chat */}
+      {step === "chat" && (
+        <div style={styles.section}>
+          <h3>Bước 3: Chat với {chatPartner?.username}</h3>
+          <div style={{ fontSize: 12, color: "green" }}>{keyStatus}</div>
+
+          <div ref={chatBoxRef} style={styles.chatBox}>
+            {messages.map((msg, idx) => (
+              <div
+                key={idx}
+                style={msg.isMine ? styles.messageSent : styles.messageReceived}
+              >
+                <div>
+                  <strong>{msg.sender}:</strong> {msg.text}
+                </div>
+                <div style={styles.meta}>{msg.time}</div>
+              </div>
+            ))}
+          </div>
+
+          <div>
+            <input
+              style={{ ...styles.input, width: "70%" }}
+              placeholder="Nhập tin nhắn..."
+              value={messageInput}
+              onChange={(e) => setMessageInput(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && sendMessage()}
+            />
+            <button style={styles.button} onClick={sendMessage}>
+              Gửi
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Debug */}
+      <div style={styles.section}>
+        <h3>🔧 Debug (Encrypted Data)</h3>
+        <div style={styles.debug}>
+          {debugLogs.length === 0 && (
+            <em>Các tin nhắn encrypted sẽ hiển thị ở đây...</em>
+          )}
+          {debugLogs.map((log, idx) => (
+            <div key={idx}>{log}</div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
