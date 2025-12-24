@@ -18,6 +18,8 @@ const userSchema = new mongoose.Schema({
   },
 });
 
+// 📌 Note: username đã có unique: true nên tự động có index, không cần thêm
+
 // Chat Schema - cuộc hội thoại giữa 2 người
 const chatSchema = new mongoose.Schema({
   participants: [
@@ -56,6 +58,10 @@ const chatSchema = new mongoose.Schema({
   },
 });
 
+// 📌 Index cho query chat theo participants
+// Tìm chat giữa 2 người - dùng $all
+chatSchema.index({ participants: 1 });
+
 // Message Schema - tin nhắn đã mã hóa
 const messageSchema = new mongoose.Schema({
   chatId: {
@@ -87,6 +93,17 @@ const messageSchema = new mongoose.Schema({
     default: Date.now,
   },
 });
+
+// 📌 Compound Index cho query message theo chatId + sắp xếp theo timestamp
+// Query pattern: find({ chatId }).sort({ timestamp: -1 })
+messageSchema.index({ chatId: 1, timestamp: -1 });
+
+// 📌 Index riêng cho senderId (để query messages của 1 user)
+messageSchema.index({ senderId: 1 });
+
+// 📌 Index cho cursor-based pagination: chatId + _id
+// Dùng _id làm cursor vì MongoDB tự động tạo _id có timestamp embedded
+messageSchema.index({ chatId: 1, _id: -1 });
 
 export const User = mongoose.model("User", userSchema);
 export const Chat = mongoose.model("Chat", chatSchema);

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { io } from "socket.io-client";
 import nacl from "tweetnacl";
 import naclUtil from "tweetnacl-util";
@@ -111,6 +111,11 @@ function App() {
   const [keyStatus, setKeyStatus] = useState("");
   const [debugLogs, setDebugLogs] = useState([]);
 
+  // Pagination state - Cursor-based
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [nextCursor, setNextCursor] = useState(null); // Cursor cho trang tiếp theo
+
   // Refs
   const myKeyPairRef = useRef(null);
   const sharedKeyRef = useRef(null);
@@ -127,9 +132,11 @@ function App() {
     setDebugLogs((prev) => [...prev.slice(-20), entry]);
   };
 
-  // Auto scroll chat
+  // Auto scroll chat (only on initial load or new messages, not on load more)
+  const shouldScrollToBottomRef = useRef(true);
+
   useEffect(() => {
-    if (chatBoxRef.current) {
+    if (chatBoxRef.current && shouldScrollToBottomRef.current) {
       chatBoxRef.current.scrollTop = chatBoxRef.current.scrollHeight;
     }
   }, [messages]);
@@ -163,6 +170,8 @@ function App() {
         `secretKey_${data.user._id}`,
         myKeyPairRef.current.secretKey
       );
+      // Store username -> userId mapping for login
+      localStorage.setItem(`userId_${username.trim()}`, data.user._id);
       log("✅ Registered", { userId: data.user._id });
 
       // Connect socket
@@ -171,6 +180,48 @@ function App() {
       loadUsers();
     } catch (error) {
       log("❌ Register error", error.message);
+    }
+  };
+
+  // ==================== LOGIN ====================
+  const login = async () => {
+    if (!username.trim()) return;
+
+    try {
+      // Lấy user từ server
+      const res = await fetch(`${API_URL}/user/by-username/${username.trim()}`);
+      const data = await res.json();
+
+      if (!res.ok) {
+        alert(data.error || "User không tồn tại");
+        return;
+      }
+
+      // Kiểm tra có secretKey trong localStorage không
+      const secretKey = localStorage.getItem(`secretKey_${data._id}`);
+      if (!secretKey) {
+        alert(
+          "Không tìm thấy private key trên thiết bị này. Vui lòng đăng ký lại."
+        );
+        return;
+      }
+
+      // Load key pair
+      myKeyPairRef.current = {
+        publicKey: data.publicKey,
+        secretKey: secretKey,
+      };
+
+      setCurrentUser(data);
+      log("✅ Logged in", { userId: data._id });
+
+      // Connect socket
+      connectSocket(data._id);
+      setStep("users");
+      loadUsers();
+    } catch (error) {
+      log("❌ Login error", error.message);
+      alert("Lỗi đăng nhập: " + error.message);
     }
   };
 
@@ -262,8 +313,10 @@ function App() {
       if (keyRes.ok) {
         const keyData = await keyRes.json();
         try {
+          // Lấy public key của sender để decrypt
           const senderRes = await fetch(`${API_URL}/user/${keyData.senderId}`);
           const sender = await senderRes.json();
+
           sharedKeyRef.current = decryptSharedKey(
             keyData.encryptedSharedKey,
             keyData.nonce,
@@ -272,15 +325,21 @@ function App() {
           );
           setKeyStatus("🔐 Đã có sharedKey từ trước");
           log("✅ Loaded existing sharedKey");
-        } catch {
+        } catch (error) {
+          log("⚠️ Cannot decrypt existing key, creating new", error.message);
           await createAndShareKey(chat._id, partner);
         }
       } else {
         await createAndShareKey(chat._id, partner);
       }
 
+      // Reset pagination state
+      setNextCursor(null);
+      setHasMoreMessages(false);
+      shouldScrollToBottomRef.current = true;
+
       setStep("chat");
-      await loadMessages(chat._id);
+      await loadMessages(chat._id, null, false);
     } catch (error) {
       log("❌ Start chat error", error.message);
     }
@@ -290,32 +349,66 @@ function App() {
     sharedKeyRef.current = generateSharedKey();
     log("🔑 Generated new sharedKey");
 
-    const { encryptedSharedKey, nonce } = encryptSharedKey(
+    // Mã hóa sharedKey cho partner (recipient)
+    const partnerKey = encryptSharedKey(
       sharedKeyRef.current,
       partner.publicKey,
       myKeyPairRef.current.secretKey
     );
 
+    // Mã hóa sharedKey cho chính mình (để có thể recover sau khi reload)
+    const myKey = encryptSharedKey(
+      sharedKeyRef.current,
+      myKeyPairRef.current.publicKey,
+      myKeyPairRef.current.secretKey
+    );
+
+    // Gửi key cho partner
     socketRef.current.emit("key_exchange", {
       chatId,
       recipientId: partner._id,
       senderId: currentUser._id,
-      encryptedSharedKey,
-      nonce,
+      encryptedSharedKey: partnerKey.encryptedSharedKey,
+      nonce: partnerKey.nonce,
+    });
+
+    // Lưu key cho chính mình
+    socketRef.current.emit("key_exchange", {
+      chatId,
+      recipientId: currentUser._id,
+      senderId: currentUser._id,
+      encryptedSharedKey: myKey.encryptedSharedKey,
+      nonce: myKey.nonce,
     });
 
     setKeyStatus("🔐 Đã tạo và gửi sharedKey");
-    log("📤 Sent encrypted sharedKey");
+    log("📤 Sent encrypted sharedKey cho cả 2 users");
   };
 
   // ==================== MESSAGES ====================
-  const loadMessages = async (chatId) => {
+  // 🔄 Cursor-based pagination cho performance tốt hơn
+  const loadMessages = async (chatId, cursor = null, isLoadingMore = false) => {
+    if (loadingMessages) return;
+
     try {
-      const res = await fetch(`${API_URL}/chat/${chatId}/messages`);
+      setLoadingMessages(true);
+      const limit = 20;
+
+      // Build URL with cursor-based pagination
+      let url = `${API_URL}/chat/${chatId}/messages?limit=${limit}`;
+      if (cursor) {
+        url += `&cursor=${cursor}`;
+      }
+
+      const res = await fetch(url);
       const data = await res.json();
 
       const decryptedMessages = [];
-      for (const msg of data) {
+      // Backend trả về descending (_id giảm dần), cần reverse để hiển thị đúng thứ tự
+      const messagesArray = data.messages || [];
+      const messagesReversed = [...messagesArray].reverse();
+
+      for (const msg of messagesReversed) {
         if (sharedKeyRef.current) {
           try {
             const plaintext = decryptMessage(
@@ -337,12 +430,70 @@ function App() {
           messageCounterRef.current = msg.messageCounter + 1;
         }
       }
-      setMessages(decryptedMessages);
-      log("📜 Loaded messages", data.length);
+
+      if (isLoadingMore) {
+        // Prepend older messages
+        setMessages((prev) => [...decryptedMessages, ...prev]);
+      } else {
+        // Initial load
+        setMessages(decryptedMessages);
+      }
+
+      // Update pagination state
+      setHasMoreMessages(data.hasMore || false);
+      setNextCursor(data.nextCursor || null);
+
+      log("📜 Loaded messages", {
+        count: messagesReversed.length,
+        hasMore: data.hasMore,
+        cursor: cursor ? "with cursor" : "initial",
+      });
     } catch (error) {
       log("❌ Load messages error", error.message);
+    } finally {
+      setLoadingMessages(false);
     }
   };
+
+  const loadMoreMessages = useCallback(() => {
+    if (currentChat && hasMoreMessages && !loadingMessages && nextCursor) {
+      loadMessages(currentChat._id, nextCursor, true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChat, hasMoreMessages, loadingMessages, nextCursor]);
+
+  // Infinite scroll - load more when scrolling to top
+  useEffect(() => {
+    const chatBox = chatBoxRef.current;
+    if (!chatBox) return;
+
+    const handleScroll = () => {
+      // If user scrolls to near top (within 50px)
+      if (chatBox.scrollTop < 50 && hasMoreMessages && !loadingMessages) {
+        // Save current scroll height to restore position
+        const previousScrollHeight = chatBox.scrollHeight;
+        shouldScrollToBottomRef.current = false;
+
+        loadMoreMessages();
+
+        // After messages load, restore scroll position
+        setTimeout(() => {
+          const newScrollHeight = chatBox.scrollHeight;
+          chatBox.scrollTop = newScrollHeight - previousScrollHeight;
+          shouldScrollToBottomRef.current = true;
+        }, 100);
+      }
+    };
+
+    chatBox.addEventListener("scroll", handleScroll);
+    return () => chatBox.removeEventListener("scroll", handleScroll);
+  }, [
+    hasMoreMessages,
+    loadingMessages,
+    nextCursor,
+    currentChat,
+    loadMoreMessages,
+  ]);
 
   const sendMessage = () => {
     if (!messageInput.trim() || !sharedKeyRef.current || !currentChat) return;
@@ -442,20 +593,31 @@ function App() {
     <div style={styles.container}>
       <h1>🔐 E2E Chat Demo (React)</h1>
 
-      {/* Step 1: Register */}
+      {/* Step 1: Register or Login */}
       {step === "register" && (
         <div style={styles.section}>
-          <h3>Bước 1: Đăng ký</h3>
+          <h3>Bước 1: Đăng ký hoặc Đăng nhập</h3>
           <input
             style={styles.input}
             placeholder="Nhập username"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            onKeyPress={(e) => e.key === "Enter" && register()}
+            onKeyPress={(e) => e.key === "Enter" && login()}
           />
           <button style={styles.button} onClick={register}>
-            Đăng ký
+            📝 Đăng ký
           </button>
+          <button
+            style={{ ...styles.button, background: "#28a745" }}
+            onClick={login}
+          >
+            🔑 Đăng nhập
+          </button>
+          <p style={{ fontSize: 12, color: "#888", marginTop: 10 }}>
+            Đăng ký: Tạo tài khoản mới với key pair mới
+            <br />
+            Đăng nhập: Sử dụng key đã lưu trên thiết bị này
+          </p>
         </div>
       )}
 
@@ -493,6 +655,16 @@ function App() {
           <div style={{ fontSize: 12, color: "green" }}>{keyStatus}</div>
 
           <div ref={chatBoxRef} style={styles.chatBox}>
+            {loadingMessages && (
+              <div style={{ textAlign: "center", padding: 10, color: "#888" }}>
+                ⏳ Đang tải tin nhắn...
+              </div>
+            )}
+            {!loadingMessages && hasMoreMessages && (
+              <div style={{ textAlign: "center", padding: 10, color: "#888" }}>
+                ↑ Cuộn lên để tải thêm tin nhắn
+              </div>
+            )}
             {messages.map((msg, idx) => (
               <div
                 key={idx}

@@ -88,6 +88,22 @@ app.get("/api/user/:id", async (req, res) => {
   }
 });
 
+// Login - lấy user theo username
+app.get("/api/user/by-username/:username", async (req, res) => {
+  try {
+    const user = await User.findOne(
+      { username: req.params.username },
+      "username publicKey"
+    );
+    if (!user) {
+      return res.status(404).json({ error: "User không tồn tại" });
+    }
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Tạo hoặc lấy cuộc chat giữa 2 người
 app.post("/api/chat/create", async (req, res) => {
   try {
@@ -161,27 +177,115 @@ app.get("/api/chat/:chatId/key/:userId", async (req, res) => {
       return res.status(404).json({ error: "Chat không tồn tại" });
     }
 
-    const keyData = chat.encryptedKeys.find(
+    // Tìm key mà user có thể dùng:
+    // - Nếu user là recipientId: key do người khác gửi cho mình
+    // - Nếu user là senderId: key do mình tạo (trường hợp user tạo key và cần lấy lại)
+    let keyData = chat.encryptedKeys.find(
       (k) => k.recipientId.toString() === userId
     );
+
+    // Nếu không tìm thấy key cho user này là recipient,
+    // thử tìm key mà user này đã tạo (là sender)
+    if (!keyData) {
+      keyData = chat.encryptedKeys.find(
+        (k) => k.senderId.toString() === userId
+      );
+
+      // Nếu tìm thấy key mà user là sender, user cần dùng sharedKey gốc
+      // (không cần decrypt vì đây là người tạo key)
+      if (keyData) {
+        // Return về để frontend biết đây là key mà mình đã tạo
+        return res.json({
+          ...keyData.toObject(),
+          isSender: true, // Flag để frontend biết đây là key mình tạo
+        });
+      }
+    }
 
     if (!keyData) {
       return res.status(404).json({ error: "Chưa có key cho user này" });
     }
 
-    res.json(keyData);
+    res.json({ ...keyData.toObject(), isSender: false });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-// Lấy tin nhắn của chat (encrypted)
+// Lấy tin nhắn của chat (encrypted) - với cursor-based pagination
 app.get("/api/chat/:chatId/messages", async (req, res) => {
   try {
-    const messages = await Message.find({ chatId: req.params.chatId })
-      .sort({ timestamp: 1 })
-      .populate("senderId", "username");
-    res.json(messages);
+    const limit = parseInt(req.query.limit) || 20;
+    const cursor = req.query.cursor; // MessageId để làm điểm bắt đầu
+
+    const query = { chatId: req.params.chatId };
+
+    // 🔄 Cursor-based pagination: Nếu có cursor, lấy messages cũ hơn cursor đó
+    if (cursor) {
+      query._id = { $lt: cursor }; // Lấy messages có _id < cursor (cũ hơn)
+    }
+
+    // ⚡ Query với index: { chatId: 1, _id: -1 }
+    // Lấy tin nhắn mới nhất trước, sort theo _id giảm dần
+    const messages = await Message.find(query)
+      .sort({ _id: -1 }) // Sort theo _id (có timestamp embedded) thay vì timestamp
+      .limit(limit + 1) // Lấy thêm 1 để check hasMore
+      .populate("senderId", "username")
+      .lean(); // .lean() để performance tốt hơn (không tạo Mongoose document)
+
+    // Check hasMore
+    const hasMore = messages.length > limit;
+    if (hasMore) {
+      messages.pop(); // Bỏ message thừa
+    }
+
+    // nextCursor là _id của message cuối cùng
+    const nextCursor =
+      messages.length > 0 ? messages[messages.length - 1]._id : null;
+
+    res.json({
+      messages,
+      hasMore,
+      nextCursor, // Client dùng nextCursor để load trang tiếp theo
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// 👥 Lấy tin nhắn của một user cụ thể (across all chats)
+app.get("/api/user/:userId/messages", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const cursor = req.query.cursor;
+
+    const query = { senderId: req.params.userId };
+
+    if (cursor) {
+      query._id = { $lt: cursor };
+    }
+
+    // ⚡ Dùng index: { senderId: 1 }
+    const messages = await Message.find(query)
+      .sort({ _id: -1 })
+      .limit(limit + 1)
+      .populate("senderId", "username")
+      .populate("chatId", "participants")
+      .lean();
+
+    const hasMore = messages.length > limit;
+    if (hasMore) {
+      messages.pop();
+    }
+
+    const nextCursor =
+      messages.length > 0 ? messages[messages.length - 1]._id : null;
+
+    res.json({
+      messages,
+      hasMore,
+      nextCursor,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
