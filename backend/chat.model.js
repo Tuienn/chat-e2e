@@ -39,35 +39,14 @@ const userSchema = new mongoose.Schema({
 // 📌 Note: username đã có unique: true nên tự động có index, không cần thêm
 
 // Chat Schema - cuộc hội thoại giữa 2 người
+// SharedKey sẽ được derive on-the-fly từ nacl.box.before(theirPubKey, myPrivKey)
+// Không lưu encryptedKeys → giảm attack surface, giống Signal/WhatsApp
 const chatSchema = new mongoose.Schema({
   participants: [
     {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
-    },
-  ],
-  // encryptedKeys: lưu sharedKey đã mã hóa cho từng participant
-  // Client tạo, server chỉ lưu & chuyển tiếp
-  encryptedKeys: [
-    {
-      recipientId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "User",
-      },
-      senderId: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "User",
-      },
-      encryptedSharedKey: String, // nacl.box encrypted (base64)
-      nonce: String, // base64
-    },
-  ],
-  // messageCounter cho mỗi participant để tạo nonce
-  counters: [
-    {
-      oderId: mongoose.Schema.Types.ObjectId,
-      count: { type: Number, default: 0 },
     },
   ],
   createdAt: {

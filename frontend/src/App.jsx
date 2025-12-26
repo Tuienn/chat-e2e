@@ -34,47 +34,14 @@ function createNonce(counter) {
   return nonce;
 }
 
-// Sinh shared key ngẫu nhiên (32 bytes)
-function generateSharedKey() {
-  return nacl.randomBytes(32);
-}
-
-// Mã hóa sharedKey bằng nacl.box
-function encryptSharedKey(sharedKeyBytes, recipientPublicKey, mySecretKey) {
-  const nonce = nacl.randomBytes(24);
-  const recipientPubKeyBytes = naclUtil.decodeBase64(recipientPublicKey);
+// Derive shared key từ public/private key pair (Signal-style)
+// Dùng nacl.box.before() để derive shared secret từ ECDH
+function deriveSharedKey(theirPublicKey, mySecretKey) {
+  const theirPubKeyBytes = naclUtil.decodeBase64(theirPublicKey);
   const mySecretKeyBytes = naclUtil.decodeBase64(mySecretKey);
-  const encrypted = nacl.box(
-    sharedKeyBytes,
-    nonce,
-    recipientPubKeyBytes,
-    mySecretKeyBytes
-  );
-  return {
-    encryptedSharedKey: naclUtil.encodeBase64(encrypted),
-    nonce: naclUtil.encodeBase64(nonce),
-  };
-}
-
-// Giải mã sharedKey
-function decryptSharedKey(
-  encryptedBase64,
-  nonceBase64,
-  senderPublicKey,
-  mySecretKey
-) {
-  const encrypted = naclUtil.decodeBase64(encryptedBase64);
-  const nonce = naclUtil.decodeBase64(nonceBase64);
-  const senderPubKeyBytes = naclUtil.decodeBase64(senderPublicKey);
-  const mySecretKeyBytes = naclUtil.decodeBase64(mySecretKey);
-  const decrypted = nacl.box.open(
-    encrypted,
-    nonce,
-    senderPubKeyBytes,
-    mySecretKeyBytes
-  );
-  if (!decrypted) throw new Error("Không thể giải mã sharedKey");
-  return decrypted;
+  // nacl.box.before() performs X25519 key agreement
+  const sharedKey = nacl.box.before(theirPubKeyBytes, mySecretKeyBytes);
+  return sharedKey; // 32 bytes shared secret
 }
 
 // Mã hóa tin nhắn bằng secretbox
@@ -289,7 +256,7 @@ function App() {
     try {
       setIsLoading(true);
 
-      // 1. Kiểm tra có secretKey trong localStorage không
+      // 1. Lấy user info
       const res = await fetch(`${API_URL}/user/by-username/${username.trim()}`);
       const userData = await res.json();
 
@@ -298,66 +265,51 @@ function App() {
         return;
       }
 
-      const secretKey = localStorage.getItem(`secretKey_${userData._id}`);
+      // 2. ALWAYS verify password bằng cách thử decrypt từ server
+      // Điều này đảm bảo password luôn được kiểm tra
+      log("🔐 Verifying password...");
 
-      if (secretKey) {
-        // Case 1: Có localStorage -> sử dụng trực tiếp
-        log("🔑 Found local key, logging in...");
-        myKeyPairRef.current = {
-          publicKey: userData.publicKey,
-          secretKey: secretKey,
-        };
-        setCurrentUser(userData);
-        log("✅ Logged in with local key", { userId: userData._id });
-      } else {
-        // Case 2: Không có localStorage -> Recovery từ server
-        log("🔐 No local key, attempting recovery from server...");
+      const keyRes = await fetch(
+        `${API_URL}/user/${username.trim()}/encrypted-key`
+      );
+      const keyData = await keyRes.json();
 
-        // Lấy encrypted key từ server
-        const keyRes = await fetch(
-          `${API_URL}/user/${username.trim()}/encrypted-key`
+      if (!keyRes.ok) {
+        alert(
+          keyData.error || "Không thể xác thực. Vui lòng đăng ký tài khoản mới."
         );
-        const keyData = await keyRes.json();
+        return;
+      }
 
-        if (!keyRes.ok) {
-          alert(
-            keyData.error ||
-              "Không thể khôi phục key. Vui lòng đăng ký tài khoản mới."
-          );
-          return;
-        }
+      // Derive Master Key từ password
+      const kdfSalt = naclUtil.decodeBase64(keyData.kdfSalt);
+      const masterKey = await deriveKeyFromPassword(password, kdfSalt);
 
-        // Derive Master Key từ password
-        log("🔐 Deriving master key from password...");
-        const kdfSalt = naclUtil.decodeBase64(keyData.kdfSalt);
-        const masterKey = await deriveKeyFromPassword(password, kdfSalt);
+      // Thử decrypt private key để verify password
+      try {
+        const decryptedPrivateKey = decryptPrivateKey(
+          keyData.encryptedPrivateKey,
+          keyData.privateKeyNonce,
+          masterKey
+        );
 
-        // Decrypt private key
-        try {
-          const decryptedPrivateKey = decryptPrivateKey(
-            keyData.encryptedPrivateKey,
-            keyData.privateKeyNonce,
-            masterKey
-          );
+        const recoveredSecretKey = naclUtil.encodeBase64(decryptedPrivateKey);
 
-          const recoveredSecretKey = naclUtil.encodeBase64(decryptedPrivateKey);
+        // Password đúng! Lưu/cập nhật vào localStorage
+        localStorage.setItem(`secretKey_${userData._id}`, recoveredSecretKey);
+        localStorage.setItem(`userId_${username.trim()}`, userData._id);
 
-          // Lưu vào localStorage
-          localStorage.setItem(`secretKey_${userData._id}`, recoveredSecretKey);
-          localStorage.setItem(`userId_${username.trim()}`, userData._id);
+        myKeyPairRef.current = {
+          publicKey: keyData.publicKey,
+          secretKey: recoveredSecretKey,
+        };
 
-          myKeyPairRef.current = {
-            publicKey: keyData.publicKey,
-            secretKey: recoveredSecretKey,
-          };
-
-          setCurrentUser(userData);
-          log("✅ Recovered key from server backup", { userId: userData._id });
-        } catch (decryptError) {
-          log("❌ Key recovery failed", decryptError.message);
-          alert("Sai password! Không thể khôi phục key.");
-          return;
-        }
+        setCurrentUser(userData);
+        log("✅ Password verified, logged in", { userId: userData._id });
+      } catch (decryptError) {
+        log("❌ Password verification failed", decryptError.message);
+        alert("Sai password!");
+        return;
       }
 
       // Connect socket
@@ -382,11 +334,7 @@ function App() {
       socketRef.current.emit("join", userId);
     });
 
-    socketRef.current.on("key_received", async (data) => {
-      console.log("🚀 ~ connectSocket ~ data:", data);
-      log("🔑 Received encrypted key");
-      // Will be handled when partner is set
-    });
+    // key_received handler đã được loại bỏ - shared key bây giờ derive on-the-fly
 
     socketRef.current.on("receive_message", (message) => {
       log("📨 Received encrypted", {
@@ -453,33 +401,23 @@ function App() {
       socketRef.current.emit("join_chat", chat._id);
       log("📝 Chat created", { chatId: chat._id });
 
-      // Check existing key
-      const keyRes = await fetch(
-        `${API_URL}/chat/${chat._id}/key/${currentUser._id}`
-      );
+      // Derive shared key từ partner's publicKey
+      // Dùng nacl.box.before() - không cần lưu hay trao đổi key
+      // Cả 2 bên sẽ derive được cùng 1 shared key từ ECDH
+      const partnerPubKey =
+        partner.publicKey ||
+        chat.participants.find((p) => p._id !== currentUser._id)?.publicKey;
 
-      if (keyRes.ok) {
-        const keyData = await keyRes.json();
-        try {
-          // Lấy public key của sender để decrypt
-          const senderRes = await fetch(`${API_URL}/user/${keyData.senderId}`);
-          const sender = await senderRes.json();
-
-          sharedKeyRef.current = decryptSharedKey(
-            keyData.encryptedSharedKey,
-            keyData.nonce,
-            sender.publicKey,
-            myKeyPairRef.current.secretKey
-          );
-          setKeyStatus("🔐 Đã có sharedKey từ trước");
-          log("✅ Loaded existing sharedKey");
-        } catch (error) {
-          log("⚠️ Cannot decrypt existing key, creating new", error.message);
-          await createAndShareKey(chat._id, partner);
-        }
-      } else {
-        await createAndShareKey(chat._id, partner);
+      if (!partnerPubKey) {
+        throw new Error("Không tìm thấy publicKey của partner");
       }
+
+      sharedKeyRef.current = deriveSharedKey(
+        partnerPubKey,
+        myKeyPairRef.current.secretKey
+      );
+      setKeyStatus("🔐 Derived sharedKey từ publicKey");
+      log("✅ Derived sharedKey using nacl.box.before()");
 
       // Reset pagination state
       setNextCursor(null);
@@ -493,45 +431,8 @@ function App() {
     }
   };
 
-  const createAndShareKey = async (chatId, partner) => {
-    sharedKeyRef.current = generateSharedKey();
-    log("🔑 Generated new sharedKey");
-
-    // Mã hóa sharedKey cho partner (recipient)
-    const partnerKey = encryptSharedKey(
-      sharedKeyRef.current,
-      partner.publicKey,
-      myKeyPairRef.current.secretKey
-    );
-
-    // Mã hóa sharedKey cho chính mình (để có thể recover sau khi reload)
-    const myKey = encryptSharedKey(
-      sharedKeyRef.current,
-      myKeyPairRef.current.publicKey,
-      myKeyPairRef.current.secretKey
-    );
-
-    // Gửi key cho partner
-    socketRef.current.emit("key_exchange", {
-      chatId,
-      recipientId: partner._id,
-      senderId: currentUser._id,
-      encryptedSharedKey: partnerKey.encryptedSharedKey,
-      nonce: partnerKey.nonce,
-    });
-
-    // Lưu key cho chính mình
-    socketRef.current.emit("key_exchange", {
-      chatId,
-      recipientId: currentUser._id,
-      senderId: currentUser._id,
-      encryptedSharedKey: myKey.encryptedSharedKey,
-      nonce: myKey.nonce,
-    });
-
-    setKeyStatus("🔐 Đã tạo và gửi sharedKey");
-    log("📤 Sent encrypted sharedKey cho cả 2 users");
-  };
+  // createAndShareKey đã được loại bỏ
+  // SharedKey bây giờ được derive on-the-fly từ nacl.box.before()
 
   // ==================== MESSAGES ====================
   // 🔄 Cursor-based pagination cho performance tốt hơn

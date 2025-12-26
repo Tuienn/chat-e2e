@@ -159,15 +159,15 @@ app.post("/api/chat/create", async (req, res) => {
     // Tìm chat đã tồn tại giữa 2 người
     let chat = await Chat.findOne({
       participants: { $all: participantIds },
-    });
+    }).populate("participants", "username publicKey");
 
     if (!chat) {
       chat = new Chat({
         participants: participantIds,
-        encryptedKeys: [],
-        counters: participantIds.map((id) => ({ oderId: id, count: 0 })),
       });
       await chat.save();
+      // Populate participants sau khi save
+      await chat.populate("participants", "username publicKey");
     }
 
     res.json(chat);
@@ -176,84 +176,9 @@ app.post("/api/chat/create", async (req, res) => {
   }
 });
 
-// Lưu encrypted sharedKey (client gửi, server chỉ lưu)
-app.post("/api/chat/:chatId/key", async (req, res) => {
-  try {
-    const { chatId } = req.params;
-    const { recipientId, senderId, encryptedSharedKey, nonce } = req.body;
-
-    const chat = await Chat.findById(chatId);
-    if (!chat) {
-      return res.status(404).json({ error: "Chat không tồn tại" });
-    }
-
-    // Thêm encrypted key vào chat
-    chat.encryptedKeys.push({
-      recipientId,
-      senderId,
-      encryptedSharedKey,
-      nonce,
-    });
-    await chat.save();
-
-    // Thông báo cho recipient qua socket
-    io.to(recipientId).emit("key_received", {
-      chatId,
-      senderId,
-      encryptedSharedKey,
-      nonce,
-    });
-
-    res.json({ message: "Key đã được lưu và gửi" });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Lấy encrypted key cho user trong chat
-app.get("/api/chat/:chatId/key/:userId", async (req, res) => {
-  try {
-    const { chatId, userId } = req.params;
-
-    const chat = await Chat.findById(chatId);
-    if (!chat) {
-      return res.status(404).json({ error: "Chat không tồn tại" });
-    }
-
-    // Tìm key mà user có thể dùng:
-    // - Nếu user là recipientId: key do người khác gửi cho mình
-    // - Nếu user là senderId: key do mình tạo (trường hợp user tạo key và cần lấy lại)
-    let keyData = chat.encryptedKeys.find(
-      (k) => k.recipientId.toString() === userId
-    );
-
-    // Nếu không tìm thấy key cho user này là recipient,
-    // thử tìm key mà user này đã tạo (là sender)
-    if (!keyData) {
-      keyData = chat.encryptedKeys.find(
-        (k) => k.senderId.toString() === userId
-      );
-
-      // Nếu tìm thấy key mà user là sender, user cần dùng sharedKey gốc
-      // (không cần decrypt vì đây là người tạo key)
-      if (keyData) {
-        // Return về để frontend biết đây là key mà mình đã tạo
-        return res.json({
-          ...keyData.toObject(),
-          isSender: true, // Flag để frontend biết đây là key mình tạo
-        });
-      }
-    }
-
-    if (!keyData) {
-      return res.status(404).json({ error: "Chưa có key cho user này" });
-    }
-
-    res.json({ ...keyData.toObject(), isSender: false });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
+// SharedKey APIs đã được loại bỏ
+// SharedKey bây giờ được derive on-the-fly từ nacl.box.before(theirPubKey, myPrivKey)
+// Xem: Signal Protocol, X3DH
 
 // Lấy tin nhắn của chat (encrypted) - với cursor-based pagination
 app.get("/api/chat/:chatId/messages", async (req, res) => {
@@ -380,43 +305,8 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Trao đổi key - forward encrypted key đến recipient
-  socket.on("key_exchange", async (data) => {
-    const { chatId, recipientId, senderId, encryptedSharedKey, nonce } = data;
-
-    try {
-      // Lưu vào DB
-      const chat = await Chat.findById(chatId);
-      if (chat) {
-        // Kiểm tra đã có key cho recipient chưa
-        const existingKey = chat.encryptedKeys.find(
-          (k) => k.recipientId.toString() === recipientId
-        );
-
-        if (!existingKey) {
-          chat.encryptedKeys.push({
-            recipientId,
-            senderId,
-            encryptedSharedKey,
-            nonce,
-          });
-          await chat.save();
-        }
-      }
-
-      // Forward to recipient
-      io.to(recipientId).emit("key_received", {
-        chatId,
-        senderId,
-        encryptedSharedKey,
-        nonce,
-      });
-
-      console.log(`🔑 Key exchanged: ${senderId} -> ${recipientId}`);
-    } catch (error) {
-      console.error("Key exchange error:", error);
-    }
-  });
+  // key_exchange socket event đã được loại bỏ
+  // SharedKey bây giờ được derive on-the-fly từ nacl.box.before()
 
   socket.on("disconnect", () => {
     console.log("❌ User disconnected:", socket.id);
