@@ -97,11 +97,69 @@ function decryptMessage(encryptedBase64, nonceBase64, sharedKeyBytes) {
   return naclUtil.encodeUTF8(decrypted);
 }
 
+// ==================== PASSWORD-DERIVED KEY FUNCTIONS ====================
+
+// Generate random salt for KDF
+function generateKdfSalt() {
+  return nacl.randomBytes(32);
+}
+
+// Derive Master Key from password using PBKDF2 (Web Crypto API)
+async function deriveKeyFromPassword(password, saltBytes) {
+  const encoder = new TextEncoder();
+  const passwordBytes = encoder.encode(password);
+
+  // Import password as key material
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    passwordBytes,
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+
+  // Derive 32 bytes using PBKDF2 with high iterations
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: "PBKDF2",
+      salt: saltBytes,
+      iterations: 600000, // High iterations for security
+      hash: "SHA-256",
+    },
+    keyMaterial,
+    256 // 32 bytes = 256 bits
+  );
+
+  return new Uint8Array(derivedBits);
+}
+
+// Encrypt private key with Master Key (derived from password)
+function encryptPrivateKey(privateKeyBytes, masterKeyBytes) {
+  const nonce = nacl.randomBytes(24);
+  const encrypted = nacl.secretbox(privateKeyBytes, nonce, masterKeyBytes);
+  return {
+    encryptedPrivateKey: naclUtil.encodeBase64(encrypted),
+    nonce: naclUtil.encodeBase64(nonce),
+  };
+}
+
+// Decrypt private key with Master Key
+function decryptPrivateKey(encryptedBase64, nonceBase64, masterKeyBytes) {
+  const encrypted = naclUtil.decodeBase64(encryptedBase64);
+  const nonce = naclUtil.decodeBase64(nonceBase64);
+  const decrypted = nacl.secretbox.open(encrypted, nonce, masterKeyBytes);
+  if (!decrypted)
+    throw new Error("Sai password - không thể giải mã private key");
+  return decrypted;
+}
+
 // ==================== MAIN APP ====================
 function App() {
   // State
   const [step, setStep] = useState("register"); // register | users | chat
   const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [users, setUsers] = useState([]);
   const [chatPartner, setChatPartner] = useState(null);
@@ -143,19 +201,53 @@ function App() {
 
   // ==================== REGISTER ====================
   const register = async () => {
-    if (!username.trim()) return;
+    if (!username.trim() || !password.trim()) {
+      alert("Vui lòng nhập username và password");
+      return;
+    }
+    if (password.length < 6) {
+      alert("Password phải có ít nhất 6 ký tự");
+      return;
+    }
 
     try {
-      // Sinh key pair
+      setIsLoading(true);
+      log("🔐 Đang tạo key và mã hóa với password...");
+
+      // 1. Sinh key pair
       myKeyPairRef.current = generateKeyPair();
       log("🔑 Generated key pair");
 
+      // 2. Generate KDF salt và derive Master Key từ password
+      const kdfSalt = generateKdfSalt();
+      const masterKey = await deriveKeyFromPassword(password, kdfSalt);
+      log("🔐 Derived master key from password");
+
+      // 3. Encrypt private key với Master Key
+      const privateKeyBytes = naclUtil.decodeBase64(
+        myKeyPairRef.current.secretKey
+      );
+      const { encryptedPrivateKey, nonce: privateKeyNonce } = encryptPrivateKey(
+        privateKeyBytes,
+        masterKey
+      );
+      log("🔒 Encrypted private key for backup");
+
+      // 4. Gửi register request với encrypted backup
       const res = await fetch(`${API_URL}/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           username: username.trim(),
           publicKey: myKeyPairRef.current.publicKey,
+          encryptedPrivateKey,
+          privateKeyNonce,
+          kdfSalt: naclUtil.encodeBase64(kdfSalt),
+          kdfParams: {
+            algorithm: "pbkdf2",
+            iterations: 600000,
+            hash: "SHA-256",
+          },
         }),
       });
 
@@ -165,63 +257,119 @@ function App() {
         return;
       }
 
+      // 5. Lưu private key vào localStorage
       setCurrentUser(data.user);
       localStorage.setItem(
         `secretKey_${data.user._id}`,
         myKeyPairRef.current.secretKey
       );
-      // Store username -> userId mapping for login
       localStorage.setItem(`userId_${username.trim()}`, data.user._id);
-      log("✅ Registered", { userId: data.user._id });
+      log("✅ Registered with encrypted key backup", { userId: data.user._id });
 
       // Connect socket
       connectSocket(data.user._id);
       setStep("users");
+      setPassword(""); // Clear password from memory
       loadUsers();
     } catch (error) {
       log("❌ Register error", error.message);
+      alert("Lỗi đăng ký: " + error.message);
+    } finally {
+      setIsLoading(false);
     }
   };
 
   // ==================== LOGIN ====================
   const login = async () => {
-    if (!username.trim()) return;
+    if (!username.trim() || !password.trim()) {
+      alert("Vui lòng nhập username và password");
+      return;
+    }
 
     try {
-      // Lấy user từ server
+      setIsLoading(true);
+
+      // 1. Kiểm tra có secretKey trong localStorage không
       const res = await fetch(`${API_URL}/user/by-username/${username.trim()}`);
-      const data = await res.json();
+      const userData = await res.json();
 
       if (!res.ok) {
-        alert(data.error || "User không tồn tại");
+        alert(userData.error || "User không tồn tại");
         return;
       }
 
-      // Kiểm tra có secretKey trong localStorage không
-      const secretKey = localStorage.getItem(`secretKey_${data._id}`);
-      if (!secretKey) {
-        alert(
-          "Không tìm thấy private key trên thiết bị này. Vui lòng đăng ký lại."
+      const secretKey = localStorage.getItem(`secretKey_${userData._id}`);
+
+      if (secretKey) {
+        // Case 1: Có localStorage -> sử dụng trực tiếp
+        log("🔑 Found local key, logging in...");
+        myKeyPairRef.current = {
+          publicKey: userData.publicKey,
+          secretKey: secretKey,
+        };
+        setCurrentUser(userData);
+        log("✅ Logged in with local key", { userId: userData._id });
+      } else {
+        // Case 2: Không có localStorage -> Recovery từ server
+        log("🔐 No local key, attempting recovery from server...");
+
+        // Lấy encrypted key từ server
+        const keyRes = await fetch(
+          `${API_URL}/user/${username.trim()}/encrypted-key`
         );
-        return;
+        const keyData = await keyRes.json();
+
+        if (!keyRes.ok) {
+          alert(
+            keyData.error ||
+              "Không thể khôi phục key. Vui lòng đăng ký tài khoản mới."
+          );
+          return;
+        }
+
+        // Derive Master Key từ password
+        log("🔐 Deriving master key from password...");
+        const kdfSalt = naclUtil.decodeBase64(keyData.kdfSalt);
+        const masterKey = await deriveKeyFromPassword(password, kdfSalt);
+
+        // Decrypt private key
+        try {
+          const decryptedPrivateKey = decryptPrivateKey(
+            keyData.encryptedPrivateKey,
+            keyData.privateKeyNonce,
+            masterKey
+          );
+
+          const recoveredSecretKey = naclUtil.encodeBase64(decryptedPrivateKey);
+
+          // Lưu vào localStorage
+          localStorage.setItem(`secretKey_${userData._id}`, recoveredSecretKey);
+          localStorage.setItem(`userId_${username.trim()}`, userData._id);
+
+          myKeyPairRef.current = {
+            publicKey: keyData.publicKey,
+            secretKey: recoveredSecretKey,
+          };
+
+          setCurrentUser(userData);
+          log("✅ Recovered key from server backup", { userId: userData._id });
+        } catch (decryptError) {
+          log("❌ Key recovery failed", decryptError.message);
+          alert("Sai password! Không thể khôi phục key.");
+          return;
+        }
       }
-
-      // Load key pair
-      myKeyPairRef.current = {
-        publicKey: data.publicKey,
-        secretKey: secretKey,
-      };
-
-      setCurrentUser(data);
-      log("✅ Logged in", { userId: data._id });
 
       // Connect socket
-      connectSocket(data._id);
+      connectSocket(userData._id);
       setStep("users");
+      setPassword(""); // Clear password from memory
       loadUsers();
     } catch (error) {
       log("❌ Login error", error.message);
       alert("Lỗi đăng nhập: " + error.message);
+    } finally {
+      setIsLoading(false);
     }
   };
 
@@ -597,27 +745,71 @@ function App() {
       {step === "register" && (
         <div style={styles.section}>
           <h3>Bước 1: Đăng ký hoặc Đăng nhập</h3>
-          <input
-            style={styles.input}
-            placeholder="Nhập username"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            onKeyPress={(e) => e.key === "Enter" && login()}
-          />
-          <button style={styles.button} onClick={register}>
-            📝 Đăng ký
+          <div style={{ marginBottom: 10 }}>
+            <input
+              style={styles.input}
+              placeholder="Nhập username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              disabled={isLoading}
+            />
+          </div>
+          <div style={{ marginBottom: 10 }}>
+            <input
+              style={styles.input}
+              type="password"
+              placeholder="Nhập password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && login()}
+              disabled={isLoading}
+            />
+          </div>
+          <button
+            style={{
+              ...styles.button,
+              opacity: isLoading ? 0.6 : 1,
+              cursor: isLoading ? "wait" : "pointer",
+            }}
+            onClick={register}
+            disabled={isLoading}
+          >
+            {isLoading ? "⏳ Đang xử lý..." : "📝 Đăng ký"}
           </button>
           <button
-            style={{ ...styles.button, background: "#28a745" }}
+            style={{
+              ...styles.button,
+              background: "#28a745",
+              opacity: isLoading ? 0.6 : 1,
+              cursor: isLoading ? "wait" : "pointer",
+            }}
             onClick={login}
+            disabled={isLoading}
           >
-            🔑 Đăng nhập
+            {isLoading ? "⏳ Đang xử lý..." : "🔑 Đăng nhập"}
           </button>
-          <p style={{ fontSize: 12, color: "#888", marginTop: 10 }}>
-            Đăng ký: Tạo tài khoản mới với key pair mới
+          <div
+            style={{
+              fontSize: 12,
+              color: "#888",
+              marginTop: 15,
+              padding: 10,
+              background: "#1a1a1a",
+              borderRadius: 4,
+            }}
+          >
+            <strong>🔐 Password-Protected Key Backup</strong>
             <br />
-            Đăng nhập: Sử dụng key đã lưu trên thiết bị này
-          </p>
+            <br />• <strong>Đăng ký:</strong> Tạo key pair mới, được mã hóa và
+            backup bằng password
+            <br />• <strong>Đăng nhập:</strong> Nếu đã có key trên thiết bị sẽ
+            dùng ngay, nếu không sẽ khôi phục từ server bằng password
+            <br />
+            <br />
+            <span style={{ color: "#ff9800" }}>
+              ⚠️ Nếu quên password sẽ KHÔNG thể khôi phục chat cũ!
+            </span>
+          </div>
         </div>
       )}
 

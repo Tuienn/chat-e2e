@@ -32,10 +32,17 @@ app.use((req, res, next) => {
 
 // ================== REST APIs ==================
 
-// Đăng ký user - client gửi username + publicKey (đã sinh ở client)
+// Đăng ký user - client gửi username + publicKey + encrypted backup
 app.post("/api/register", async (req, res) => {
   try {
-    const { username, publicKey } = req.body;
+    const {
+      username,
+      publicKey,
+      encryptedPrivateKey,
+      privateKeyNonce,
+      kdfSalt,
+      kdfParams,
+    } = req.body;
 
     if (!username || !publicKey) {
       return res
@@ -49,7 +56,14 @@ app.post("/api/register", async (req, res) => {
       return res.status(400).json({ error: "Username đã tồn tại" });
     }
 
-    const user = new User({ username, publicKey });
+    const user = new User({
+      username,
+      publicKey,
+      encryptedPrivateKey: encryptedPrivateKey || null,
+      privateKeyNonce: privateKeyNonce || null,
+      kdfSalt: kdfSalt || null,
+      kdfParams: kdfParams || undefined,
+    });
     await user.save();
 
     res.status(201).json({
@@ -58,6 +72,7 @@ app.post("/api/register", async (req, res) => {
         _id: user._id,
         username: user.username,
         publicKey: user.publicKey,
+        hasBackup: !!user.encryptedPrivateKey,
       },
     });
   } catch (error) {
@@ -99,6 +114,34 @@ app.get("/api/user/by-username/:username", async (req, res) => {
       return res.status(404).json({ error: "User không tồn tại" });
     }
     res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get encrypted private key for recovery on new device
+app.get("/api/user/:username/encrypted-key", async (req, res) => {
+  try {
+    const user = await User.findOne(
+      { username: req.params.username },
+      "encryptedPrivateKey privateKeyNonce kdfSalt kdfParams publicKey"
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User không tồn tại" });
+    }
+
+    if (!user.encryptedPrivateKey) {
+      return res.status(404).json({ error: "No backup key found" });
+    }
+
+    res.json({
+      encryptedPrivateKey: user.encryptedPrivateKey,
+      privateKeyNonce: user.privateKeyNonce,
+      kdfSalt: user.kdfSalt,
+      kdfParams: user.kdfParams,
+      publicKey: user.publicKey,
+    });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
