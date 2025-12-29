@@ -118,6 +118,7 @@ function App() {
   const [password, setPassword] = useState(""); // Password for E2E key encryption
   const [isLoading, setIsLoading] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
+  const [currentUserRole, setCurrentUserRole] = useState(""); // admin | customer | staff
   const [users, setUsers] = useState([]);
   const [chatPartner, setChatPartner] = useState(null);
   const [currentChat, setCurrentChat] = useState(null);
@@ -224,13 +225,17 @@ function App() {
         `secretKey_${userId}`,
         myKeyPairRef.current.secretKey
       );
-      log("✅ Registered chat key", { userId });
+
+      // Decode role from accessToken
+      const tokenPayload = JSON.parse(atob(accessToken.split(".")[1]));
+      setCurrentUserRole(tokenPayload.role || "customer");
+      log("✅ Registered chat key", { userId, role: tokenPayload.role });
 
       // Connect socket
       connectSocket(userId);
       setStep("users");
       setPassword("");
-      loadUsers();
+      loadUsers(tokenPayload.role);
     } catch (error) {
       log("❌ Register error", error.message);
       alert("Lỗi đăng ký: " + error.message);
@@ -296,19 +301,28 @@ function App() {
           secretKey: recoveredSecretKey,
         };
 
+        // Decode role from accessToken
+        const tokenPayload = JSON.parse(atob(accessToken.split(".")[1]));
+        setCurrentUserRole(tokenPayload.role || "customer");
         setCurrentUser({ _id: userId, publicKey: keyInfo.publicKey });
-        log("✅ Password verified, logged in", { userId });
+        log("✅ Password verified, logged in", {
+          userId,
+          role: tokenPayload.role,
+        });
       } catch (decryptError) {
         log("❌ Password verification failed", decryptError.message);
         alert("Sai password!");
         return;
       }
 
+      // Decode role from accessToken for loadUsers
+      const tokenPayload = JSON.parse(atob(accessToken.split(".")[1]));
+
       // Connect socket
       connectSocket(userId);
       setStep("users");
       setPassword("");
-      loadUsers();
+      loadUsers(tokenPayload.role);
     } catch (error) {
       log("❌ Login error", error.message);
       alert("Lỗi đăng nhập: " + error.message);
@@ -361,7 +375,7 @@ function App() {
   };
 
   // ==================== USERS ====================
-  const loadUsers = async () => {
+  const loadUsers = async (userRole) => {
     try {
       const res = await fetch(`${API_URL}/chat-key/users`, {
         headers: getHeaders(),
@@ -370,13 +384,36 @@ function App() {
       const userList = data.data || data || [];
 
       // Filter out current user
-      const filteredUsers = userList.filter((u) => {
+      let filteredUsers = userList.filter((u) => {
         const uid = u.userId?._id || u.userId;
         return String(uid) !== String(userId);
       });
 
+      // If current user is NOT admin, only show admins to chat with
+      if (userRole !== "admin") {
+        filteredUsers = filteredUsers.filter(
+          (u) => u.userId?.name === "Administrator"
+        );
+        log(
+          "📋 Filtered to admins only (you are not admin)",
+          filteredUsers.length
+        );
+
+        // Auto-start chat with first admin for customers
+        if (filteredUsers.length > 0) {
+          log("🚀 Auto-starting chat with admin for customer");
+          setUsers(filteredUsers);
+          // Automatically start chat with first admin
+          setTimeout(() => {
+            startChat(filteredUsers[0]);
+          }, 100);
+          return;
+        }
+      } else {
+        log("📋 Loaded all users (you are admin)", filteredUsers.length);
+      }
+
       setUsers(filteredUsers);
-      log("📋 Loaded users", filteredUsers.length);
     } catch (error) {
       log("❌ Load users error", error.message);
     }
@@ -756,16 +793,54 @@ function App() {
           <h3>Bước 2: Chọn người để chat</h3>
           <p style={{ marginBottom: 15 }}>
             Đang đăng nhập với userId: <strong>{userId}</strong>
+            <span
+              style={{
+                marginLeft: 10,
+                padding: "4px 10px",
+                borderRadius: 4,
+                background: currentUserRole === "admin" ? "#28a745" : "#6c757d",
+                color: "white",
+                fontSize: 12,
+              }}
+            >
+              {currentUserRole.toUpperCase()}
+            </span>
           </p>
-          <button style={styles.button} onClick={loadUsers}>
-            🔄 Refresh danh sách
-          </button>
+          {currentUserRole !== "admin" && (
+            <div
+              style={{
+                padding: 12,
+                background: "#332700",
+                borderRadius: 6,
+                marginBottom: 15,
+                border: "1px solid #ffc107",
+              }}
+            >
+              ⚠️ <strong>Lưu ý:</strong> Bạn không phải admin, bạn chỉ có thể
+              chat với admin.
+            </div>
+          )}
+          {/* Admin only: Refresh button */}
+          {currentUserRole === "admin" && (
+            <button
+              style={styles.button}
+              onClick={() => loadUsers(currentUserRole)}
+            >
+              🔄 Refresh danh sách
+            </button>
+          )}
 
           <div style={{ marginTop: 15 }}>
             {users.map((user, idx) => (
               <div
                 key={user._id || idx}
-                style={styles.userItem}
+                style={{
+                  ...styles.userItem,
+                  borderLeft:
+                    user.userId?.name === "Administrator"
+                      ? "4px solid #28a745"
+                      : "4px solid #6c757d",
+                }}
                 onClick={() => startChat(user)}
                 onMouseEnter={(e) =>
                   (e.currentTarget.style.background = "#3d3d3d")
@@ -774,18 +849,41 @@ function App() {
                   (e.currentTarget.style.background = "#2d2d2d")
                 }
               >
-                <strong>
-                  {user.userId?.name || user.userId?.email || "User"}
-                </strong>
-                <br />
+                <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <strong>
+                    {user.userId?.name || user.userId?.email || "User"}
+                  </strong>
+                  <span
+                    style={{
+                      padding: "2px 8px",
+                      borderRadius: 4,
+                      background:
+                        user.userId?.name === "Administrator"
+                          ? "#28a745"
+                          : "#6c757d",
+                      color: "white",
+                      fontSize: 10,
+                      textTransform: "uppercase",
+                    }}
+                  >
+                    {user.userId?.name || "user"}
+                  </span>
+                </div>
                 <span style={{ fontSize: 11, color: "#888" }}>
                   ID: {user.userId?._id || user.userId}
                 </span>
               </div>
             ))}
-            {users.length === 0 && (
+            {/* Admin only: Show empty message */}
+            {users.length === 0 && currentUserRole === "admin" && (
               <p style={{ color: "#888", fontStyle: "italic" }}>
                 Chưa có user khác đăng ký chat key. Mở tab mới với user khác.
+              </p>
+            )}
+            {/* Customer: Show waiting message if no admin */}
+            {users.length === 0 && currentUserRole !== "admin" && (
+              <p style={{ color: "#888", fontStyle: "italic" }}>
+                ⏳ Đang tìm admin để hỗ trợ...
               </p>
             )}
           </div>
